@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -86,6 +87,38 @@ func TestAssistantEndpointDegradesWhenProfileFails(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &response)
 	if response.Dependencies[0].Status != models.DependencyStatusFailed {
 		t.Fatalf("expected failed profile dependency, got %s", response.Dependencies[0].Status)
+	}
+}
+
+func TestAssistantEndpointDegradesWhenTransactionsFail(t *testing.T) {
+	router := newTestRouter(t, dependencyHandlers{
+		profile: func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(models.Profile{CustomerID: "pj-risk", Segment: "smb", KYCStatus: "complete", RiskTier: "medium"})
+		},
+		transactions: func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "transactions error", http.StatusServiceUnavailable)
+		},
+		agent: func(w http.ResponseWriter, r *http.Request) {
+			var payload models.AgentRequest
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if payload.Transactions != nil {
+				t.Fatal("expected missing transactions in degraded scenario")
+			}
+			_ = json.NewEncoder(w).Encode(models.AgentResponse{Answer: "Resposta degradada.", ReasoningSummary: "Sem transacoes completas.", FallbackUsed: true})
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/assistant/pj-risk?question=Analise+financeira", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var response models.AssistantResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &response)
+	if response.Dependencies[1].Status != models.DependencyStatusFailed {
+		t.Fatalf("expected failed transactions dependency, got %s", response.Dependencies[1].Status)
 	}
 }
 
@@ -199,6 +232,39 @@ func TestAssistantEndpointRetriesTransientProfileError(t *testing.T) {
 	}
 	if atomic.LoadInt32(&profileCalls) != 3 {
 		t.Fatalf("expected 3 profile calls, got %d", profileCalls)
+	}
+}
+
+func TestMetricsExposeRequestErrors(t *testing.T) {
+	router := newTestRouter(t, dependencyHandlers{
+		profile: func(w http.ResponseWriter, _ *http.Request) {
+			time.Sleep(250 * time.Millisecond)
+			_ = json.NewEncoder(w).Encode(models.Profile{CustomerID: "pj-timeout"})
+		},
+		transactions: func(w http.ResponseWriter, _ *http.Request) {
+			time.Sleep(250 * time.Millisecond)
+			_ = json.NewEncoder(w).Encode(models.TransactionsSnapshot{CustomerID: "pj-timeout"})
+		},
+		agent: func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(models.AgentResponse{Answer: "na", ReasoningSummary: "na"})
+		},
+		timeout: 100 * time.Millisecond,
+	})
+
+	failingReq := httptest.NewRequest(http.MethodGet, "/v1/assistant/pj-timeout?question=Analise+financeira", nil)
+	failingRec := httptest.NewRecorder()
+	router.ServeHTTP(failingRec, failingReq)
+	if failingRec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("expected 504, got %d body=%s", failingRec.Code, failingRec.Body.String())
+	}
+
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRec := httptest.NewRecorder()
+	router.ServeHTTP(metricsRec, metricsReq)
+
+	body := metricsRec.Body.String()
+	if !strings.Contains(body, `bfa_http_request_errors_total{error_code="dependency_timeout",route="/v1/assistant/{customerId}"} 1`) {
+		t.Fatalf("expected request error metric to be exposed, got metrics body=%s", body)
 	}
 }
 

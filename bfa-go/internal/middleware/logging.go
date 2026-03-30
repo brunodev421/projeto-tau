@@ -42,6 +42,11 @@ func Logging(logger *slog.Logger, metrics *observability.Metrics) func(http.Hand
 			if customerID == "" {
 				customerID = chi.URLParam(r, "customerId")
 			}
+			downstream := recorder.Header().Get("X-Downstream")
+			if downstream == "" {
+				downstream = "none"
+			}
+			errorCode := recorder.Header().Get("X-Error-Code")
 
 			log := logger.With(
 				"timestamp", time.Now().UTC().Format(time.RFC3339Nano),
@@ -49,14 +54,19 @@ func Logging(logger *slog.Logger, metrics *observability.Metrics) func(http.Hand
 				"customer_id", customerID,
 				"route", route,
 				"latency_ms", duration.Milliseconds(),
+				"downstream", downstream,
 			)
 
 			if recorder.status >= http.StatusBadRequest {
-				log.Error("request failed", "error_code", strconv.Itoa(recorder.status))
+				if errorCode == "" {
+					errorCode = strconv.Itoa(recorder.status)
+				}
+				metrics.RequestErrors.WithLabelValues(route, errorCode).Inc()
+				log.Error("request failed", "error_code", errorCode)
 				return
 			}
 
-			log.Info("request completed")
+			log.Info("request completed", "error_code", "")
 		})
 	}
 }

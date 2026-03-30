@@ -55,10 +55,10 @@ Arquitetura detalhada e diagramas em [docs/architecture.md](/Users/bruno/Downloa
 - `/healthz`, `/readyz`, `/metrics` em BFA e Agent Service.
 - logs JSON estruturados no BFA.
 - tracing OTEL entre BFA e Agent via `otelhttp`.
-- LangGraph com fluxo explícito `input_normalizer -> planner -> structured -> retrieve_knowledge -> evaluate_relevance -> policy -> synthesize -> validate -> finalize`.
+- LangGraph com fluxo explícito `input_normalizer -> planner -> structured -> retrieve_knowledge -> evaluate_relevance -> policy -> synthesize -> validate? -> finalize`.
 - tools obrigatórias implementadas.
 - RAG funcional com chunking, vetor local, score, threshold, top-k, deduplicação, tags e rejeição de contexto fraco.
-- guardrails contra prompt injection, redução de PII, contexto permitido, budget por `customerId` e fallback conservador.
+- guardrails contra prompt injection, redução de PII, contexto permitido, filtro de chunks maliciosos no RAG, budget por `customerId` e fallback conservador.
 - testes unitários e de integração.
 - módulo simples de avaliação com dataset e script.
 
@@ -237,7 +237,7 @@ Resumo:
 7. `synthesize`
    consolida resposta final.
 8. `validate`
-   usa `OptionalFinalValidatorTool` e guardrails.
+   usa `OptionalFinalValidatorTool` e guardrails quando o planner habilita validação.
 9. `finalize`
    monta o JSON final e calcula custo estimado.
 
@@ -327,9 +327,11 @@ Implementado via `LangfuseFacade`:
 - troca da pergunta original por uma pergunta segura quando a entrada é maliciosa
 - contexto permitido separado do contexto bruto
 - redaction de PII básica em perguntas
+- filtragem de chunks recuperados que tentem alterar instruções ou revelar prompts
 - logs do BFA sem payload sensível
 - budget por `customerId` com limite de requests e custo estimado
 - fallback conservador quando budget, tools ou validação falham
+- fallback interno do agent para exceções inesperadas no workflow
 - guardrails para evitar vazamento de prompt e respostas longas demais
 - versionamento de prompt por `PROMPT_VERSION = v1.0.0`
 - resposta nunca usa a base recuperada para alterar regras do sistema
@@ -362,6 +364,7 @@ Cobertura entregue:
 
 - sucesso ponta a ponta do BFA com dependências simuladas
 - falha da Profile API
+- falha da Transactions API
 - timeout em dependências
 - fallback do BFA quando o agent falha
 - retry com falha transitória
@@ -369,8 +372,11 @@ Cobertura entregue:
 - workflow do agente
 - schema/contrato da resposta do agente
 - cenário adversarial com prompt injection
+- chunk malicioso no RAG
+- erro de tool/RAG e fallback interno do agent
 - budget/fallback por cliente
 - cenário de RAG sem contexto relevante
+- execução condicional do validator
 - dataset simples de avaliação
 
 ## Assumptions
@@ -429,5 +435,3 @@ make run-agent
 make run-bfa
 make ingest
 ```
-
-# projeto-tau

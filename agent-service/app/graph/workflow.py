@@ -13,6 +13,7 @@ from app.security.guards import (
     allowed_transactions_context,
     detect_prompt_injection,
     enforce_response_guardrails,
+    filter_retrieved_chunks,
     redact_pii,
     sanitize_text,
 )
@@ -44,8 +45,9 @@ def build_workflow(
         safe_question = redact_pii(normalized_question)
         safe_profile = allowed_profile_context(request.profile)
         safe_transactions = allowed_transactions_context(request.transactions)
+        dependency_flags = derive_dependency_flags(request.dependency_status, safe_profile, safe_transactions)
         allowed, reason = budget_tracker.check(request.customer_id)
-        fallback_used = not allowed or bool(prompt_flags)
+        fallback_used = not allowed or bool(prompt_flags) or should_use_conservative_mode(dependency_flags)
         if prompt_flags:
             safe_question = "Forneca uma avaliacao segura e conservadora da saude financeira da empresa com base apenas no contexto permitido."
             FALLBACK_COUNT.labels(reason="prompt_injection").inc()
@@ -66,7 +68,7 @@ def build_workflow(
             "tools_used": [],
             "sources": [],
             "recommendations": [],
-            "risk_flags": list(dict.fromkeys(prompt_flags)),
+            "risk_flags": list(dict.fromkeys(prompt_flags + dependency_flags)),
         }
 
     def planner(state: AgentState) -> dict[str, Any]:
@@ -89,8 +91,14 @@ def build_workflow(
         tags = infer_tags(state["safe_question"], state["structured_summary"])
         kb_payload = tools["KnowledgeBaseRAGTool"].invoke({"query": state["safe_question"], "tags": tags})
         kb_results = [RetrievedChunk.model_validate(item) for item in kb_payload]
-        sources = state["sources"] + chunk_sources(kb_results)
-        return {"kb_results": kb_results, "sources": sources, "tools_used": state["tools_used"] + ["KnowledgeBaseRAGTool"]}
+        filtered_results, filtered_flags = filter_retrieved_chunks(kb_results)
+        sources = state["sources"] + chunk_sources(filtered_results)
+        return {
+            "kb_results": filtered_results,
+            "sources": sources,
+            "tools_used": state["tools_used"] + ["KnowledgeBaseRAGTool"],
+            "risk_flags": list(dict.fromkeys(state["risk_flags"] + filtered_flags)),
+        }
 
     def evaluate_relevance(state: AgentState) -> dict[str, Any]:
         kb_results = state.get("kb_results", [])
@@ -113,7 +121,7 @@ def build_workflow(
     def synthesize(state: AgentState) -> dict[str, Any]:
         structured_summary = state["structured_summary"]
         kb_results = [] if state.get("kb_rejected") else state.get("kb_results", [])
-        fallback_used = state.get("fallback_used", False) or bool(state.get("budget_block_reason"))
+        fallback_used = state.get("fallback_used", False) or bool(state.get("budget_block_reason")) or needs_partial_context_fallback(structured_summary)
         draft_answer = build_draft_answer(state["safe_question"], structured_summary, state["recommendations"], kb_results, fallback_used)
         reasoning_summary = build_reasoning_summary(structured_summary, kb_results, state["risk_flags"])
         llm_output = model_gateway.synthesize(
@@ -156,8 +164,18 @@ def build_workflow(
         }
 
     def finalize(state: AgentState) -> dict[str, Any]:
-        answer = state["validator_output"]["sanitized_answer"]
-        if state["fallback_used"]:
+        validator_output = state.get(
+            "validator_output",
+            ValidationResult(
+                accepted=True,
+                violations=[],
+                sanitized_answer=state["draft_answer"],
+                fallback_used=state.get("fallback_used", False),
+            ).model_dump(),
+        )
+        answer = validator_output["sanitized_answer"]
+        fallback_used = state.get("fallback_used", False) or validator_output.get("fallback_used", False)
+        if fallback_used:
             answer = prepend_fallback_prefix(answer)
         model_input = state["safe_question"] + str(state.get("structured_summary", {})) + str([item.model_dump() for item in state.get("kb_results", [])])
         input_tokens, output_tokens, estimated_cost = token_estimator.estimate(model_input, answer)
@@ -175,7 +193,7 @@ def build_workflow(
             sources=state["sources"] or ["fallback://no-kb"],
             tools_used=state["tools_used"],
             risk_flags=state["risk_flags"],
-            fallback_used=state["fallback_used"],
+            fallback_used=fallback_used,
             cost_estimate=CostEstimate(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
@@ -205,11 +223,15 @@ def build_workflow(
     graph.add_edge("retrieve_knowledge", "evaluate_relevance")
     graph.add_conditional_edges(
         "evaluate_relevance",
-        lambda state: "policy" if not state.get("kb_rejected") else "policy",
+        lambda state: "policy",
         {"policy": "policy_recommendations"},
     )
     graph.add_edge("policy_recommendations", "synthesize")
-    graph.add_edge("synthesize", "validate")
+    graph.add_conditional_edges(
+        "synthesize",
+        lambda state: "validate" if state["plan"].use_validator else "finalize",
+        {"validate": "validate", "finalize": "finalize"},
+    )
     graph.add_edge("validate", "finalize")
     graph.add_edge("finalize", END)
     return graph.compile()
@@ -229,10 +251,41 @@ def infer_tags(question: str, structured_summary: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(tags))
 
 
+def derive_dependency_flags(dependency_status: list[Any], safe_profile: dict[str, Any] | None, safe_transactions: dict[str, Any] | None) -> list[str]:
+    flags: list[str] = []
+    if safe_profile is None:
+        flags.append("profile_missing")
+    if safe_transactions is None:
+        flags.append("transactions_missing")
+    for item in dependency_status:
+        status = getattr(item, "status", None) or item.get("status")
+        name = getattr(item, "name", None) or item.get("name")
+        if status in {"failed", "degraded"} and name:
+            flags.append(f"{name}_{status}")
+    return list(dict.fromkeys(flags))
+
+
+def should_use_conservative_mode(risk_flags: list[str]) -> bool:
+    conservative_flags = {
+        "profile_missing",
+        "transactions_missing",
+        "profile_api_failed",
+        "transactions_api_failed",
+        "profile_api_degraded",
+        "transactions_api_degraded",
+    }
+    return any(flag in conservative_flags for flag in risk_flags)
+
+
+def needs_partial_context_fallback(structured_summary: dict[str, Any]) -> bool:
+    return structured_summary.get("profile_status") == "missing" or structured_summary.get("transactions_status") == "missing"
+
+
 def build_draft_answer(question: str, structured_summary: dict[str, Any], recommendations: list[str], kb_results: list[RetrievedChunk], fallback_used: bool) -> str:
     health = structured_summary.get("cashflow_health", "unknown")
     margin = structured_summary.get("monthly_margin_brl")
     profile_status = structured_summary.get("profile_status")
+    transactions_status = structured_summary.get("transactions_status")
     supporting_evidence = ""
     if kb_results:
         top_evidence = "; ".join(f"{item.title} (score={item.rerank_score or item.score})" for item in kb_results[:2])
@@ -241,6 +294,18 @@ def build_draft_answer(question: str, structured_summary: dict[str, Any], recomm
         return (
             "A analise foi concluida em modo conservador por indisponibilidade parcial de contexto ou restricao de budget. "
             f"Pergunta original: {question}. Considere validar a decisao com dados atualizados.{supporting_evidence}"
+        )
+    if profile_status == "missing" or transactions_status == "missing":
+        missing_parts: list[str] = []
+        if profile_status == "missing":
+            missing_parts.append("perfil")
+        if transactions_status == "missing":
+            missing_parts.append("transacoes")
+        return (
+            "A analise foi concluida com contexto parcial, pois houve indisponibilidade em "
+            f"{', '.join(missing_parts)}. "
+            "A recomendacao mais segura e manter postura conservadora ate que os dados sejam atualizados."
+            + supporting_evidence
         )
     if health == "risk":
         return (

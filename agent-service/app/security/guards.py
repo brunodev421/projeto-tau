@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any
 
-from app.models.schemas import Profile, TransactionsSnapshot
+from app.models.schemas import Profile, RetrievedChunk, TransactionsSnapshot
 
 PROMPT_VERSION = "v1.0.0"
 
@@ -12,11 +13,18 @@ INJECTION_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in [
         r"ignore (all|any|previous) instructions",
+        r"ignore .*instruc",
         r"system prompt",
+        r"prompt do sistema",
         r"developer message",
+        r"mensagem do desenvolvedor",
         r"reveal .*prompt",
+        r"revele .*prompt",
         r"execute .*tool",
+        r"execute .*ferramenta",
         r"change .*policy",
+        r"altere .*politica",
+        r"desconsidere .*instruc",
     ]
 ]
 
@@ -39,6 +47,19 @@ def redact_pii(text: str) -> str:
     text = re.sub(r"[\w\.-]+@[\w\.-]+", "[redacted-email]", text)
     text = re.sub(r"\b\d{10,16}\b", "[redacted-number]", text)
     return text
+
+
+def filter_retrieved_chunks(chunks: list[RetrievedChunk]) -> tuple[list[RetrievedChunk], list[str]]:
+    safe_chunks: list[RetrievedChunk] = []
+    flags: list[str] = []
+    for chunk in chunks:
+        combined_text = f"{chunk.title}\n{chunk.content}"
+        if detect_prompt_injection(combined_text):
+            flags.append("kb_prompt_injection_detected")
+            continue
+        sanitized_content = redact_pii(sanitize_text(chunk.content, max_chars=1200))
+        safe_chunks.append(chunk.model_copy(update={"content": sanitized_content}))
+    return safe_chunks, list(dict.fromkeys(flags))
 
 
 def allowed_profile_context(profile: Profile | None) -> dict[str, Any] | None:
@@ -85,17 +106,20 @@ class CustomerBudgetTracker:
     max_requests: int
     request_count: dict[str, int] = field(default_factory=dict)
     accumulated_cost: dict[str, float] = field(default_factory=dict)
+    lock: Lock = field(default_factory=Lock, repr=False)
 
     def check(self, customer_id: str) -> tuple[bool, str | None]:
-        if self.request_count.get(customer_id, 0) >= self.max_requests:
-            return False, "request_budget_exceeded"
-        if self.accumulated_cost.get(customer_id, 0.0) >= self.max_cost_usd:
-            return False, "cost_budget_exceeded"
-        return True, None
+        with self.lock:
+            if self.request_count.get(customer_id, 0) >= self.max_requests:
+                return False, "request_budget_exceeded"
+            if self.accumulated_cost.get(customer_id, 0.0) >= self.max_cost_usd:
+                return False, "cost_budget_exceeded"
+            return True, None
 
     def register(self, customer_id: str, estimated_cost: float) -> None:
-        self.request_count[customer_id] = self.request_count.get(customer_id, 0) + 1
-        self.accumulated_cost[customer_id] = self.accumulated_cost.get(customer_id, 0.0) + estimated_cost
+        with self.lock:
+            self.request_count[customer_id] = self.request_count.get(customer_id, 0) + 1
+            self.accumulated_cost[customer_id] = self.accumulated_cost.get(customer_id, 0.0) + estimated_cost
 
 
 def enforce_response_guardrails(answer: str, reasoning_summary: str) -> tuple[str, list[str]]:
@@ -110,4 +134,3 @@ def enforce_response_guardrails(answer: str, reasoning_summary: str) -> tuple[st
     if len(reasoning_summary) > 500:
         violations.append("reasoning_summary_too_long")
     return sanitized, violations
-

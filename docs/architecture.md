@@ -29,8 +29,10 @@ flowchart TD
     E --> F[evaluate_relevance]
     F --> G
     G --> H[synthesize]
-    H --> I[validate]
-    I --> J[finalize]
+    H --> I{use validator?}
+    I -->|yes| J[validate]
+    I -->|no| K[finalize]
+    J --> K
 ```
 
 ## Communication Pattern
@@ -83,4 +85,3 @@ flowchart TD
 - cache de perfil reduz chamadas downstream
 - top-k controlado e threshold evitam contexto irrelevante e custo inútil
 - escolha dinâmica de modelo recomendada em produção
-
