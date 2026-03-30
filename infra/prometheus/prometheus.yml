@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: bfa-go
+    static_configs:
+      - targets: ["bfa-go:8080"]
+
+  - job_name: agent-service
+    static_configs:
+      - targets: ["agent-service:8090"]
+
+  - job_name: mock-services
+    static_configs:
+      - targets: ["mock-services:8081"]
+

@@ -1,0 +1,68 @@
+version: "3.9"
+
+services:
+  mock-services:
+    build:
+      context: .
+      dockerfile: ./mock-services/Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      MOCK_PORT: 8081
+
+  agent-service:
+    build:
+      context: .
+      dockerfile: ./agent-service/Dockerfile
+    ports:
+      - "8090:8090"
+    environment:
+      AGENT_PORT: 8090
+      AGENT_LLM_MODE: ${AGENT_LLM_MODE:-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    volumes:
+      - ./knowledge-base:/app/knowledge-base
+    depends_on:
+      - otel-collector
+
+  bfa-go:
+    build:
+      context: .
+      dockerfile: ./bfa-go/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      BFA_PORT: 8080
+      BFA_PROFILE_API_URL: http://mock-services:8081
+      BFA_TRANSACTIONS_API_URL: http://mock-services:8081
+      BFA_AGENT_SERVICE_URL: http://agent-service:8090
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    depends_on:
+      - mock-services
+      - agent-service
+      - otel-collector
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - bfa-go
+      - agent-service
+      - mock-services
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.109.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./infra/otel/collector-config.yaml:/etc/otelcol/config.yaml:ro
+
